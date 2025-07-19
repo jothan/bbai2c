@@ -1,5 +1,6 @@
 //! Bit-banged async I2C implementation
 use core::time::Duration;
+use embedded_hal::digital;
 use embedded_hal::i2c::{NoAcknowledgeSource, SevenBitAddress};
 use embedded_hal_async::{delay::DelayNs, i2c};
 use futures_lite::FutureExt;
@@ -7,6 +8,7 @@ use std::fmt::Debug;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error<P> {
+    Address,
     Bus,
     ArbitrationLoss,
     StretchTimeout,
@@ -25,32 +27,28 @@ impl<P: Debug> embedded_hal_async::i2c::Error for Error<P> {
             Error::Nack(source) => i2c::ErrorKind::NoAcknowledge(*source),
             Error::Overrun => i2c::ErrorKind::Overrun,
             Error::PinError(_) => i2c::ErrorKind::Bus,
-            Error::Other => i2c::ErrorKind::Other,
+            _ => i2c::ErrorKind::Other,
         }
     }
 }
 
-impl<P: embedded_hal::digital::Error> From<P> for Error<P> {
+impl<P: digital::Error> From<P> for Error<P> {
     fn from(err: P) -> Self {
         Error::PinError(err)
     }
 }
-pub struct Operation<'a> {
-    address: SevenBitAddress,
-    buffer: OperationType<'a>,
-}
-
-pub trait I2cPin: embedded_hal::digital::InputPin + embedded_hal_async::digital::Wait {
+pub trait Pin: digital::InputPin + embedded_hal_async::digital::Wait {
     fn set_low(&mut self) -> Result<(), Self::Error>;
     fn set_high(&mut self) -> Result<(), Self::Error>;
 }
 
-pub enum OperationType<'a> {
-    Read(&'a mut [u8]),
-    Write(&'a [u8]),
+/// Transaction operation with an explicit address for each operation.
+pub enum Operation<'a> {
+    Read(SevenBitAddress, &'a mut [u8]),
+    Write(SevenBitAddress, &'a [u8]),
 }
 
-pub struct Initiator<T: DelayNs, D: I2cPin, C: I2cPin> {
+pub struct Initiator<T, D, C> {
     timer: T,
     sda: D,
     scl: C,
@@ -58,12 +56,8 @@ pub struct Initiator<T: DelayNs, D: I2cPin, C: I2cPin> {
     stretch_timeout: Duration,
 }
 
-impl<
-    P: Into<Error<P>> + embedded_hal::digital::Error,
-    T: DelayNs,
-    D: I2cPin<Error = P>,
-    C: I2cPin<Error = P>,
-> Initiator<T, D, C>
+impl<P: Into<Error<P>> + digital::Error, T: DelayNs, D: Pin<Error = P>, C: Pin<Error = P>>
+    Initiator<T, D, C>
 {
     pub fn new(timer: T, sda: D, scl: C, period: Duration, stretch_timeout: Duration) -> Self {
         Self {
@@ -142,19 +136,17 @@ impl<
         Ok(())
     }
 
-    async fn stretch_timeout(timer: &mut T, stretch_timeout: Duration) -> Result<(), Error<P>> {
-        timer
-            .delay_ms(stretch_timeout.as_millis().try_into().unwrap())
-            .await;
-        Err(Error::StretchTimeout)
-    }
-
     async fn set_clock_high(&mut self) -> Result<(), Error<P>> {
         self.scl.set_high()?;
         self.wait().await;
 
         async { self.scl.wait_for_high().await.map_err(Error::PinError) }
-            .or(Self::stretch_timeout(&mut self.timer, self.stretch_timeout))
+            .or(async {
+                self.timer
+                    .delay_ms(self.stretch_timeout.as_millis().try_into().unwrap())
+                    .await;
+                Err(Error::StretchTimeout)
+            })
             .await?;
 
         Ok(())
@@ -185,7 +177,7 @@ impl<
             let bit = (0x80 >> i) & byte != 0;
             self.write_bit(bit).await?;
         }
-        Ok(self.read_bit().await?)
+        self.read_bit().await
     }
 
     async fn read_transaction(
@@ -193,6 +185,9 @@ impl<
         address: SevenBitAddress,
         buffer: &mut [u8],
     ) -> Result<(), Error<P>> {
+        if address > 127 {
+            return Err(Error::Address);
+        }
         let nack = self.write_byte(address << 1 | 1).await?;
         if nack {
             return Err(Error::Nack(NoAcknowledgeSource::Address));
@@ -213,6 +208,9 @@ impl<
         address: SevenBitAddress,
         buffer: &[u8],
     ) -> Result<(), Error<P>> {
+        if address > 127 {
+            return Err(Error::Address);
+        }
         let nack = self.write_byte(address << 1).await?;
         if nack {
             return Err(Error::Nack(NoAcknowledgeSource::Address));
@@ -231,18 +229,16 @@ impl<
         Ok(())
     }
 
-    async fn transaction_inner(&mut self, operation: &mut Operation<'_>) -> Result<(), Error<P>> {
-        match operation.buffer {
-            OperationType::Write(buffer) => self.write_transaction(operation.address, buffer).await,
-            OperationType::Read(ref mut buffer) => {
-                self.read_transaction(operation.address, buffer).await
-            }
+    async fn transaction_inner(&mut self, operation: Operation<'_>) -> Result<(), Error<P>> {
+        match operation {
+            Operation::Write(address, buffer) => self.write_transaction(address, buffer).await,
+            Operation::Read(address, buffer) => self.read_transaction(address, buffer).await,
         }
     }
 
     pub async fn transaction<'a>(
         &mut self,
-        operations: impl Iterator<Item = &'a mut Operation<'a>>,
+        operations: impl Iterator<Item = Operation<'a>>,
     ) -> Result<(), Error<P>> {
         for (i, operation) in operations.enumerate() {
             if i == 0 {
@@ -257,5 +253,27 @@ impl<
         }
         self.stop().await?;
         Ok(())
+    }
+}
+
+impl<P: Into<Error<P>> + digital::Error, T, D: Pin<Error = P>, C: Pin<Error = P>> i2c::ErrorType
+    for Initiator<T, D, C>
+{
+    type Error = Error<P>;
+}
+
+impl<P: Into<Error<P>> + digital::Error, T: DelayNs, D: Pin<Error = P>, C: Pin<Error = P>> i2c::I2c
+    for Initiator<T, D, C>
+{
+    async fn transaction(
+        &mut self,
+        address: u8,
+        operations: &mut [i2c::Operation<'_>],
+    ) -> Result<(), Self::Error> {
+        self.transaction(operations.iter_mut().map(|op| match op {
+            i2c::Operation::Read(buffer) => Operation::Read(address, buffer),
+            i2c::Operation::Write(buffer) => Operation::Write(address, buffer),
+        }))
+        .await
     }
 }
