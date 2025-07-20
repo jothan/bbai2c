@@ -42,15 +42,14 @@ impl<P: Debug> core::fmt::Display for Error<P> {
 
 impl<P: Debug> core::error::Error for Error<P> {}
 
-impl<P: digital::Error> From<P> for Error<P> {
+impl<P> From<P> for Error<P> {
     fn from(err: P) -> Self {
         Error::PinError(err)
     }
 }
-pub trait Pin: digital::InputPin + embedded_hal_async::digital::Wait {
-    fn set_low(&mut self) -> Result<(), Self::Error>;
-    fn set_high(&mut self) -> Result<(), Self::Error>;
-}
+pub trait Pin: digital::InputPin + digital::OutputPin + embedded_hal_async::digital::Wait {}
+
+impl<T: digital::InputPin + digital::OutputPin + embedded_hal_async::digital::Wait> Pin for T {}
 
 /// Transaction operation with an explicit address for each operation.
 pub enum Operation<'a> {

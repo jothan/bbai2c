@@ -8,6 +8,6 @@ readme = "README.md"
 repository = "https://github.com/jothan/bbai2c"
 
 [dependencies]
-embedded-hal = "1.0"
-embedded-hal-async = "1.0"
+embedded-hal = { version = "1.0", default-features = false }
+embedded-hal-async = { version = "1.0", default-features = false }
 futures-lite = { version = "2.6", default-features = false }
