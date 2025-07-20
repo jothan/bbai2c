@@ -1,10 +1,12 @@
+#![no_std]
+
 //! Bit-banged async I2C implementation
+use core::fmt::Debug;
 use core::time::Duration;
 use embedded_hal::digital;
 use embedded_hal::i2c::{NoAcknowledgeSource, SevenBitAddress};
 use embedded_hal_async::{delay::DelayNs, i2c};
 use futures_lite::FutureExt;
-use std::fmt::Debug;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error<P> {
@@ -12,6 +14,7 @@ pub enum Error<P> {
     Bus,
     ArbitrationLoss,
     StretchTimeout,
+    InvalidParameter,
     Nack(NoAcknowledgeSource),
     Overrun,
     PinError(P),
@@ -23,7 +26,6 @@ impl<P: Debug> embedded_hal_async::i2c::Error for Error<P> {
         match self {
             Error::Bus => i2c::ErrorKind::Bus,
             Error::ArbitrationLoss => i2c::ErrorKind::ArbitrationLoss,
-            Error::StretchTimeout => i2c::ErrorKind::Other,
             Error::Nack(source) => i2c::ErrorKind::NoAcknowledge(*source),
             Error::Overrun => i2c::ErrorKind::Overrun,
             Error::PinError(_) => i2c::ErrorKind::Bus,
@@ -33,7 +35,7 @@ impl<P: Debug> embedded_hal_async::i2c::Error for Error<P> {
 }
 
 impl<P: Debug> core::fmt::Display for Error<P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{self:?}")
     }
 }
@@ -60,21 +62,33 @@ pub struct Initiator<T, D, C> {
     timer: T,
     sda: D,
     scl: C,
-    period: Duration,
-    stretch_timeout: Duration,
+    period_ns: u32,
+    stretch_timeout_ms: u32,
 }
 
 impl<P: Into<Error<P>> + digital::Error, T: DelayNs, D: Pin<Error = P>, C: Pin<Error = P>>
     Initiator<T, D, C>
 {
-    pub fn new(timer: T, sda: D, scl: C, period: Duration, stretch_timeout: Duration) -> Self {
-        Self {
+    pub fn new(
+        timer: T,
+        sda: D,
+        scl: C,
+        period: Duration,
+        stretch_timeout: Duration,
+    ) -> Result<Self, Error<P>> {
+        Ok(Self {
             timer,
             sda,
             scl,
-            period,
-            stretch_timeout,
-        }
+            period_ns: period
+                .as_nanos()
+                .try_into()
+                .map_err(|_| Error::InvalidParameter)?,
+            stretch_timeout_ms: stretch_timeout
+                .as_millis()
+                .try_into()
+                .map_err(|_| Error::InvalidParameter)?,
+        })
     }
 
     pub async fn init(&mut self) -> Result<(), Error<P>> {
@@ -150,9 +164,7 @@ impl<P: Into<Error<P>> + digital::Error, T: DelayNs, D: Pin<Error = P>, C: Pin<E
 
         async { self.scl.wait_for_high().await.map_err(Error::PinError) }
             .or(async {
-                self.timer
-                    .delay_ms(self.stretch_timeout.as_millis().try_into().unwrap())
-                    .await;
+                self.timer.delay_ms(self.stretch_timeout_ms).await;
                 Err(Error::StretchTimeout)
             })
             .await?;
@@ -161,9 +173,7 @@ impl<P: Into<Error<P>> + digital::Error, T: DelayNs, D: Pin<Error = P>, C: Pin<E
     }
 
     async fn wait(&mut self) {
-        self.timer
-            .delay_ns(self.period.as_nanos().try_into().unwrap())
-            .await;
+        self.timer.delay_ns(self.period_ns).await;
     }
 
     async fn read_byte(&mut self, nack: bool) -> Result<u8, Error<P>> {
@@ -179,8 +189,8 @@ impl<P: Into<Error<P>> + digital::Error, T: DelayNs, D: Pin<Error = P>, C: Pin<E
         Ok(byte)
     }
 
+    /// Returns a boolean with the NACK status of the byte written.
     async fn write_byte(&mut self, byte: u8) -> Result<bool, Error<P>> {
-        //! Returns a boolean with the NACK status of the byte written.
         for i in 0..8 {
             let bit = (0x80 >> i) & byte != 0;
             self.write_bit(bit).await?;
@@ -227,7 +237,7 @@ impl<P: Into<Error<P>> + digital::Error, T: DelayNs, D: Pin<Error = P>, C: Pin<E
         for (last, byte) in buffer
             .iter()
             .enumerate()
-            .map(|(i, byte)| (i + 1 == buffer_len, byte))
+            .map(|(i, byte)| (i == buffer_len - 1, byte))
         {
             let nack = self.write_byte(*byte).await?;
             if nack && !last {

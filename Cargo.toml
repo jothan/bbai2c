@@ -10,4 +10,4 @@ repository = "https://github.com/jothan/bbai2c"
 [dependencies]
 embedded-hal = "1.0"
 embedded-hal-async = "1.0"
-futures-lite = "2.6"
+futures-lite = { version = "2.6", default-features = false }
