@@ -32,6 +32,14 @@ impl<P: Debug> embedded_hal_async::i2c::Error for Error<P> {
     }
 }
 
+impl<P: Debug> core::fmt::Display for Error<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl<P: Debug> core::error::Error for Error<P> {}
+
 impl<P: digital::Error> From<P> for Error<P> {
     fn from(err: P) -> Self {
         Error::PinError(err)
@@ -71,7 +79,7 @@ impl<P: Into<Error<P>> + digital::Error, T: DelayNs, D: Pin<Error = P>, C: Pin<E
 
     pub async fn init(&mut self) -> Result<(), Error<P>> {
         self.sda.set_high()?;
-        self.scl.set_high()?;
+        self.set_clock_high().await?;
         Ok(())
     }
 
