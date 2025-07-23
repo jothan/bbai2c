@@ -17,7 +17,7 @@ pub enum Error<P> {
     InvalidParameter,
     Nack(NoAcknowledgeSource),
     Overrun,
-    PinError(P),
+    Gpio(P),
     Other,
 }
 
@@ -28,7 +28,7 @@ impl<P: Debug> embedded_hal_async::i2c::Error for Error<P> {
             Error::ArbitrationLoss => i2c::ErrorKind::ArbitrationLoss,
             Error::Nack(source) => i2c::ErrorKind::NoAcknowledge(*source),
             Error::Overrun => i2c::ErrorKind::Overrun,
-            Error::PinError(_) => i2c::ErrorKind::Bus,
+            Error::Gpio(_) => i2c::ErrorKind::Bus,
             _ => i2c::ErrorKind::Other,
         }
     }
@@ -44,7 +44,7 @@ impl<P: Debug> core::error::Error for Error<P> {}
 
 impl<P> From<P> for Error<P> {
     fn from(err: P) -> Self {
-        Error::PinError(err)
+        Error::Gpio(err)
     }
 }
 pub trait Pin: digital::InputPin + digital::OutputPin + embedded_hal_async::digital::Wait {}
