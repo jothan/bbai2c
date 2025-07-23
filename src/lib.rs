@@ -57,12 +57,40 @@ pub enum Operation<'a> {
     Write(SevenBitAddress, &'a [u8]),
 }
 
+struct Waiter {
+    period_ns: u32,
+    stretch_timeout_ms: u32,
+}
+
+impl Waiter {
+    async fn set_clock_high<C: Pin<Error = P>, P: Into<Error<P>> + digital::Error, T: DelayNs>(
+        &self,
+        scl: &mut C,
+        timer: &mut T,
+    ) -> Result<(), Error<P>> {
+        scl.set_high().map_err(Error::Gpio)?;
+        timer.delay_ns(self.period_ns).await;
+
+        async { scl.wait_for_high().await.map_err(Error::Gpio) }
+            .or(async {
+                timer.delay_ms(self.stretch_timeout_ms).await;
+                Err(Error::StretchTimeout)
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    async fn wait(&self, timer: &mut impl DelayNs) {
+        timer.delay_ns(self.period_ns).await;
+    }
+}
+
 pub struct Initiator<T, D, C> {
     timer: T,
     sda: D,
     scl: C,
-    period_ns: u32,
-    stretch_timeout_ms: u32,
+    waiter: Waiter,
 }
 
 impl<P: Into<Error<P>> + digital::Error, T: DelayNs, D: Pin<Error = P>, C: Pin<Error = P>>
@@ -79,20 +107,24 @@ impl<P: Into<Error<P>> + digital::Error, T: DelayNs, D: Pin<Error = P>, C: Pin<E
             timer,
             sda,
             scl,
-            period_ns: period
-                .as_nanos()
-                .try_into()
-                .map_err(|_| Error::InvalidParameter)?,
-            stretch_timeout_ms: stretch_timeout
-                .as_millis()
-                .try_into()
-                .map_err(|_| Error::InvalidParameter)?,
+            waiter: Waiter {
+                period_ns: period
+                    .as_nanos()
+                    .try_into()
+                    .map_err(|_| Error::InvalidParameter)?,
+                stretch_timeout_ms: stretch_timeout
+                    .as_millis()
+                    .try_into()
+                    .map_err(|_| Error::InvalidParameter)?,
+            },
         })
     }
 
     pub async fn init(&mut self) -> Result<(), Error<P>> {
         self.sda.set_high()?;
-        self.set_clock_high().await?;
+        self.waiter
+            .set_clock_high(&mut self.scl, &mut self.timer)
+            .await?;
         Ok(())
     }
 
@@ -110,7 +142,9 @@ impl<P: Into<Error<P>> + digital::Error, T: DelayNs, D: Pin<Error = P>, C: Pin<E
     async fn repeat_start(&mut self) -> Result<(), Error<P>> {
         self.sda.set_high()?;
         self.wait().await;
-        self.set_clock_high().await?;
+        self.waiter
+            .set_clock_high(&mut self.scl, &mut self.timer)
+            .await?;
 
         self.start().await
     }
@@ -119,7 +153,9 @@ impl<P: Into<Error<P>> + digital::Error, T: DelayNs, D: Pin<Error = P>, C: Pin<E
         self.sda.set_low()?;
         self.wait().await;
 
-        self.set_clock_high().await?;
+        self.waiter
+            .set_clock_high(&mut self.scl, &mut self.timer)
+            .await?;
 
         self.sda.set_high()?;
         self.wait().await;
@@ -133,46 +169,54 @@ impl<P: Into<Error<P>> + digital::Error, T: DelayNs, D: Pin<Error = P>, C: Pin<E
     async fn read_bit(&mut self) -> Result<bool, Error<P>> {
         self.sda.set_high()?;
         self.wait().await;
-        self.set_clock_high().await?;
+        self.waiter
+            .set_clock_high(&mut self.scl, &mut self.timer)
+            .await?;
 
         let bit = self.sda.is_high()?;
         self.scl.set_low()?;
         Ok(bit)
     }
 
-    async fn write_bit(&mut self, bit: bool) -> Result<(), Error<P>> {
+    async fn watch_arbitration<R, F: Future<Output = Result<R, Error<P>>>>(
+        bit: bool,
+        sda: &mut D,
+        f: impl FnOnce() -> F,
+    ) -> Result<R, Error<P>> {
         if bit {
-            self.sda.set_high()?;
+            sda.set_high()?;
         } else {
-            self.sda.set_low()?;
-        }
-        self.wait().await;
-        self.set_clock_high().await?;
-
-        if bit && self.sda.is_low()? {
-            return Err(Error::ArbitrationLoss);
+            sda.set_low()?;
         }
 
-        self.scl.set_low()?;
-        Ok(())
+        let fut = f();
+        let loss = async {
+            if bit {
+                sda.wait_for_low().await?;
+                Err(Error::ArbitrationLoss)
+            } else {
+                core::future::pending::<()>().await;
+                unreachable!()
+            }
+        };
+        Ok(loss.or(fut).await?)
     }
 
-    async fn set_clock_high(&mut self) -> Result<(), Error<P>> {
-        self.scl.set_high()?;
-        self.wait().await;
+    async fn write_bit(&mut self, bit: bool) -> Result<(), Error<P>> {
+        Self::watch_arbitration(bit, &mut self.sda, async || {
+            self.waiter.wait(&mut self.timer).await;
+            self.waiter
+                .set_clock_high(&mut self.scl, &mut self.timer)
+                .await?;
+            self.scl.set_low()?;
 
-        async { self.scl.wait_for_high().await.map_err(Error::PinError) }
-            .or(async {
-                self.timer.delay_ms(self.stretch_timeout_ms).await;
-                Err(Error::StretchTimeout)
-            })
-            .await?;
-
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     async fn wait(&mut self) {
-        self.timer.delay_ns(self.period_ns).await;
+        self.waiter.wait(&mut self.timer).await;
     }
 
     async fn read_byte(&mut self, nack: bool) -> Result<u8, Error<P>> {
